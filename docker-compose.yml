@@ -1,0 +1,54 @@
+services:
+  fastapi_api:
+    build:
+      context: ./fastapi_api
+    container_name: fastapi_api
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg2://shai:shai@postgres:5432/shai_db}"
+    ports:
+      - "8000:8000"
+    networks:
+      default:
+        aliases:
+          - fastapi_api
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  frontend_app:
+    build:
+      context: ./frontend_app
+    container_name: frontend_app
+    depends_on:
+      - fastapi_api
+    ports:
+      - "3000:80"
+    networks:
+      default:
+        aliases:
+          - frontend_app
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: shai_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "shai"
+      POSTGRES_PASSWORD: "shai"
+      POSTGRES_DB: "shai_db"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      default:
+        aliases:
+          - postgres
+
+networks:
+  default:
+    driver: bridge
+
+volumes:
+  pgdata:
+

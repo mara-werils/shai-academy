@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+venv/
+.env
+
+
+/frontend_app/node_modules
+/frontend_app/dist
+/frontend_app/.vite
+/frontend_app/build
+
+.vscode/
+.idea/
+
+*.key
+*.token
+*.pem

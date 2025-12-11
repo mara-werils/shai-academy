@@ -1,0 +1,115 @@
+{
+  "name": "FastAPI Trigger",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "fastapi_trigger",
+        "options": {
+          "responseMode": "onReceived"
+        }
+      },
+      "id": "Webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        380,
+        300
+      ],
+      "webhookId": "webhook-test/fastapi_trigger"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json[\"type\"]}}",
+              "value2": "Text2Img"
+            }
+          ]
+        }
+      },
+      "id": "IF",
+      "name": "IF type == Text2Img",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        600,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "none",
+        "requestMethod": "POST",
+        "url": "http://mock_ai_service:9000/generate",
+        "jsonParameters": true,
+        "options": {},
+        "bodyParametersJson": "={\"prompt\": $json[\"prompt\"], \"type\": $json[\"type\"], \"task_id\": $json[\"task_id\"], \"user_id\": $json[\"user_id\"]}"
+      },
+      "id": "HTTPRequest",
+      "name": "HTTP Request to Mock AI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        820,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "Respond",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1040,
+        200
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "IF type == Text2Img",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF type == Text2Img": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request to Mock AI",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "HTTP Request to Mock AI": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {},
+  "versionId": "1",
+  "id": "fastapi-trigger-workflow"
+}
+
