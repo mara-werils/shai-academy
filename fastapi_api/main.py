@@ -5,17 +5,20 @@ import copy
 import random
 import json
 import logging
+from datetime import datetime, timedelta
 from typing import Optional
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from datetime import datetime
 from dotenv import load_dotenv
 import requests
+from jose import jwt, JWTError
+from passlib.context import CryptContext
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -26,6 +29,12 @@ load_dotenv()
 
 # Получаем URL ComfyUI из переменной окружения
 COMFY_URL = os.getenv("RUNPOD_COMFY_URL")
+SECRET_KEY = os.getenv("JWT_SECRET", "change-me-please")
+ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "60"))
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 app = FastAPI(title="shai.academy API", version="1.0.0")
 
@@ -42,6 +51,16 @@ engine = create_engine(
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    name = Column(String, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class Task(Base):
@@ -82,17 +101,113 @@ def init_db():
 init_db()
 
 
-def get_comfyui_image_url(prompt_id: str, max_wait: int = 120) -> Optional[str]:
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+FORBIDDEN_TERMS = {
+    # Sexual explicit
+    "sexual",
+    "sex",
+    "porn",
+    "pornographic",
+    "pornography",
+    "nude",
+    "naked",
+    "nsfw",
+    "explicit",
+    "fetish",
+    "genitals",
+    # Violence / self-harm
+    "violence",
+    "violent",
+    "gore",
+    "blood",
+    "beheading",
+    "suicide",
+    "self-harm",
+    "murder",
+    "kill",
+    "killing",
+    # Hate / harassment
+    "hate",
+    "racist",
+    "racism",
+    "homophobic",
+    "slur",
+    "abuse",
+    "harass",
+    "terror",
+    "terrorist",
+    # Child exploitation (hard block)
+    "child porn",
+    "child sexual",
+    "csam",
+    "loli",
+    "underage",
+}
+
+
+def check_prompt_guardrails(prompt: str):
+    text = prompt.lower()
+    for term in FORBIDDEN_TERMS:
+        if term in text:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Prompt rejected by safety filter (contains '{term}').",
+            )
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def get_user_by_email(db, email: str) -> Optional[User]:
+    return db.query(User).filter(User.email == email).first()
+
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: SessionLocal = Depends(get_db)) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: Optional[str] = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    user = db.query(User).filter(User.id == int(user_id)).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+
+def get_comfyui_output_url(prompt_id: str, max_wait: int = 120, allowed_ext: Optional[list[str]] = None) -> Optional[str]:
     """
-    Опрашивает ComfyUI API для получения URL сгенерированного изображения.
-    
-    Args:
-        prompt_id: ID задачи от ComfyUI
-        max_wait: Максимальное время ожидания в секундах
-    
-    Returns:
-        URL изображения или None, если не удалось получить
+    Опрашивает ComfyUI API для получения URL сгенерированного файла (изображение/видео).
     """
+    if allowed_ext is None:
+        allowed_ext = ["png", "jpg", "jpeg", "webp"]
+
     start_time = time.time()
     poll_interval = 2  # Опрашиваем каждые 2 секунды
     
@@ -130,34 +245,33 @@ def get_comfyui_image_url(prompt_id: str, max_wait: int = 120) -> Optional[str]:
                     # Проверяем, есть ли выходные данные (outputs)
                     if isinstance(task_data, dict) and "outputs" in task_data:
                         outputs = task_data["outputs"]
-                        
-                        # Ищем узел SaveImage (обычно это узел "9")
+
+                        def pick_file(record: dict) -> Optional[str]:
+                            filename = record.get("filename", "")
+                            subfolder = record.get("subfolder", "")
+                            file_type = record.get("type", "output")
+                            if not filename:
+                                return None
+                            ext = filename.split(".")[-1].lower()
+                            if ext not in allowed_ext:
+                                return None
+                            view_url = f"{COMFY_URL.rstrip('/')}/view"
+                            params = {"filename": filename, "type": file_type}
+                            if subfolder:
+                                params["subfolder"] = subfolder
+                            return f"{view_url}?{urlencode(params)}"
+
+                        # Ищем в images/files/video
                         for node_id, node_output in outputs.items():
-                            if isinstance(node_output, dict) and "images" in node_output:
-                                images = node_output["images"]
-                                if images and len(images) > 0:
-                                    # Берем первое изображение
-                                    image_info = images[0]
-                                    filename = image_info.get("filename", "")
-                                    subfolder = image_info.get("subfolder", "")
-                                    image_type = image_info.get("type", "output")
-                                    
-                                    if filename:
-                                        # Формируем URL для получения изображения
-                                        # ComfyUI обычно хранит изображения в /view endpoint
-                                        view_url = f"{COMFY_URL.rstrip('/')}/view"
-                                        params = {}
-                                        if filename:
-                                            params["filename"] = filename
-                                        if subfolder:
-                                            params["subfolder"] = subfolder
-                                        params["type"] = image_type
-                                        
-                                        # Строим полный URL
-                                        image_url = f"{view_url}?{urlencode(params)}"
-                                        
-                                        logger.info(f"Found image URL: {image_url}")
-                                        return image_url
+                            if isinstance(node_output, dict):
+                                for key in ["images", "files", "video"]:
+                                    if key in node_output:
+                                        items = node_output[key]
+                                        if items and len(items) > 0:
+                                            url = pick_file(items[0])
+                                            if url:
+                                                logger.info(f"Found output URL: {url}")
+                                                return url
                     
                     # Если outputs нет, но есть status, проверяем статус
                     if isinstance(task_data, dict) and "status" in task_data:
@@ -182,6 +296,28 @@ def get_comfyui_image_url(prompt_id: str, max_wait: int = 120) -> Optional[str]:
     
     logger.warning(f"Timeout waiting for prompt_id {prompt_id} after {max_wait}s")
     return None
+
+
+class UserBase(BaseModel):
+    email: str = Field(..., description="User email")
+    name: str = Field(..., min_length=1, description="User name")
+
+
+class UserCreate(UserBase):
+    password: str = Field(..., min_length=6, max_length=72, description="User password")
+
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+
+class UserOut(UserBase):
+    id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 class GenerateRequest(BaseModel):
@@ -288,7 +424,10 @@ COMFY_WORKFLOW_TEMPLATE = {
     "10": {
         "inputs": {
             "model": ["11", 0],
-            "clip": ["11", 1]
+            "clip": ["11", 1],
+            "lora_name": "add-detail-xl.safetensors",
+            "strength_model": 1,
+            "strength_clip": 1
         },
         "class_type": "LoraLoader",
         "properties": {
@@ -309,7 +448,10 @@ COMFY_WORKFLOW_TEMPLATE = {
     "11": {
         "inputs": {
             "model": ["4", 0],
-            "clip": ["4", 1]
+            "clip": ["4", 1],
+            "lora_name": "blindbox_v1_mix.safetensors",
+            "strength_model": 0.9,
+            "strength_clip": 1
         },
         "class_type": "LoraLoader",
         "properties": {
@@ -329,82 +471,187 @@ COMFY_WORKFLOW_TEMPLATE = {
     }
 }
 
+# Шаблон ComfyUI workflow для видео (по предоставленному JSON)
+COMFY_VIDEO_WORKFLOW_TEMPLATE = {
+    "3": {
+        "inputs": {
+            "seed": 575373598559925,
+            "steps": 30,  # заменяется на steps пользователя
+            "cfg": 6,
+            "sampler_name": "uni_pc",
+            "scheduler": "simple",
+            "denoise": 1,
+            "model": ["48", 0],
+            "positive": ["6", 0],
+            "negative": ["7", 0],
+            "latent_image": ["40", 0]
+        },
+        "class_type": "KSampler"
+    },
+    "6": {
+        "inputs": {
+            "text": "a fox moving quickly in a beautiful winter scenery nature trees mountains daytime tracking camera",
+            "clip": ["38", 0]
+        },
+        "class_type": "CLIPTextEncode"
+    },
+    "7": {
+        "inputs": {
+            "text": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+            "clip": ["38", 0]
+        },
+        "class_type": "CLIPTextEncode"
+    },
+    "8": {
+        "inputs": {
+            "samples": ["3", 0],
+            "vae": ["39", 0]
+        },
+        "class_type": "VAEDecode"
+    },
+    "28": {
+        "inputs": {
+            "images": ["8", 0],
+            "filename_prefix": "ComfyUI_video",
+            "lossless": False,
+            "quality": 90,
+            "fps": 16,
+            "method": "default"
+        },
+        "class_type": "SaveAnimatedWEBP",
+        "widgets_values": [
+            "ComfyUI",
+            16,
+            False,
+            90,
+            "default"
+        ]
+    },
+    "39": {
+        "inputs": {
+            "vae_name": "wan_2.1_vae.safetensors"
+        },
+        "class_type": "VAELoader",
+        "widgets_values": ["wan_2.1_vae.safetensors"]
+    },
+    "40": {
+        "inputs": {
+            "width": 832,
+            "height": 480,
+            "length": 33,
+            "batch_size": 1
+        },
+        "class_type": "EmptyHunyuanLatentVideo",
+        "widgets_values": [
+            832,
+            480,
+            33,
+            1
+        ]
+    },
+    "47": {
+        "inputs": {
+            "images": ["8", 0],
+            "filename_prefix": "ComfyUI_video",
+            "codec": "vp9",
+            "fps": 24,
+            "crf": 32
+        },
+        "class_type": "SaveWEBM",
+        "widgets_values": [
+            "ComfyUI",
+            "vp9",
+            24,
+            32
+        ]
+    },
+    "48": {
+        "inputs": {
+            "model": ["37", 0],
+            "shift": 8
+        },
+        "class_type": "ModelSamplingSD3",
+        "widgets_values": [8]
+    },
+    "37": {
+        "inputs": {
+            "unet_name": "wan2.1_t2v_1.3B_fp16.safetensors",
+            "weight_dtype": "default"
+        },
+        "class_type": "UNETLoader",
+        "widgets_values": [
+            "wan2.1_t2v_1.3B_fp16.safetensors",
+            "default"
+        ]
+    },
+    "38": {
+        "inputs": {
+            "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+            "type": "wan"
+        },
+        "class_type": "CLIPLoader",
+        "widgets_values": [
+            "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+            "wan",
+            "default"
+        ]
+    }
+}
+
 
 @app.post("/api/generate/image", response_model=GenerateResponse)
-async def generate_image(payload: GenerateRequest):
+async def generate_image(payload: GenerateRequest, current_user: User = Depends(get_current_user)):
+    check_prompt_guardrails(payload.prompt)
     if not COMFY_URL:
         raise HTTPException(
             status_code=500,
             detail="COMFY_URL not configured. Please set RUNPOD_COMFY_URL environment variable."
         )
     
-    # Создаем копию шаблона workflow
     workflow = copy.deepcopy(COMFY_WORKFLOW_TEMPLATE)
-    
-    # Вставляем данные пользователя в workflow
     workflow["3"]["inputs"]["steps"] = payload.steps
-    workflow["3"]["inputs"]["seed"] = random.randint(0, 2**32 - 1)  # Случайный seed для разнообразия
+    workflow["3"]["inputs"]["seed"] = random.randint(0, 2**32 - 1)
     workflow["6"]["inputs"]["text"] = payload.prompt
     
-    # Подготавливаем данные для отправки в ComfyUI
-    # ComfyUI API требует client_id для отслеживания сессий
     client_id = f"shai_academy_{int(time.time())}"
     prompt_data = {
         "prompt": workflow,
         "client_id": client_id
     }
     
-    # Логируем данные для отладки
     logger.info(f"Sending request to ComfyUI: {COMFY_URL}")
     logger.info(f"Client ID: {client_id}")
     logger.debug(f"Workflow data: {json.dumps(workflow, indent=2)}")
     
-    # Отправляем POST-запрос на ComfyUI API
     try:
-        # Пробуем разные варианты URL
-        comfy_urls = [
-            f"{COMFY_URL.rstrip('/')}/prompt",
-            f"{COMFY_URL.rstrip('/')}/api/v1/prompt",
-        ]
-        
-        last_error = None
-        for comfy_url in comfy_urls:
+        comfy_url = f"{COMFY_URL.rstrip('/')}/prompt"
+        logger.info(f"Trying URL: {comfy_url}")
+        response = requests.post(
+            comfy_url,
+            json=prompt_data,
+            headers={"Content-Type": "application/json"},
+            timeout=60,
+        )
+        logger.info(f"Response status: {response.status_code}")
+        logger.info(f"Response headers: {dict(response.headers)}")
+        response_text = response.text
+        logger.debug(f"Response text: {response_text}")
+        if response.status_code != 200:
+            error_detail = f"ComfyUI returned status {response.status_code}"
             try:
-                logger.info(f"Trying URL: {comfy_url}")
-                response = requests.post(
-                    comfy_url,
-                    json=prompt_data,
-                    headers={"Content-Type": "application/json"},
-                    timeout=60  # Увеличиваем таймаут для генерации изображений
-                )
-                
-                logger.info(f"Response status: {response.status_code}")
-                logger.info(f"Response headers: {dict(response.headers)}")
-                
-                # Если получили успешный ответ, выходим из цикла
-                if response.status_code == 200:
-                    break
-                    
-                # Если это не последний URL, пробуем следующий
-                if comfy_url != comfy_urls[-1]:
-                    logger.warning(f"URL {comfy_url} returned status {response.status_code}, trying next...")
-                    continue
-                
-                # Если это последний URL и статус не 200, поднимаем ошибку
-                response.raise_for_status()
-                
-            except requests.exceptions.RequestException as e:
-                last_error = e
-                logger.error(f"Error with URL {comfy_url}: {str(e)}")
-                if comfy_url == comfy_urls[-1]:
-                    raise
-                continue
+                error_json = response.json()
+                logger.error(f"ComfyUI error JSON: {json.dumps(error_json, indent=2)}")
+                if isinstance(error_json, dict):
+                    if "error" in error_json:
+                        error_detail += f": {error_json['error']}"
+                    elif "message" in error_json:
+                        error_detail += f": {error_json['message']}"
+                    else:
+                        error_detail += f": {error_json}"
+            except Exception:
+                error_detail += f": {response_text[:500]}"
+            raise HTTPException(status_code=502, detail=error_detail)
         
-        # Если все URL не сработали
-        if last_error:
-            raise last_error
-        
-        # Получаем ответ от ComfyUI
         try:
             comfy_response = response.json()
             logger.info(f"ComfyUI response: {json.dumps(comfy_response, indent=2)}")
@@ -415,16 +662,12 @@ async def generate_image(payload: GenerateRequest):
                 detail=f"ComfyUI returned invalid JSON: {response.text[:500]}"
             )
         
-        # Генерируем task_id (можно использовать из ответа ComfyUI, если есть)
         task_id = comfy_response.get("prompt_id", f"comfy_task_{int(time.time())}")
-        
         logger.info(f"ComfyUI accepted prompt with ID: {task_id}")
         
-        # Опрашиваем ComfyUI для получения результата
         logger.info("Polling ComfyUI for result...")
-        image_url = get_comfyui_image_url(task_id, max_wait=120)
+        image_url = get_comfyui_output_url(task_id, max_wait=120)
         
-        # Сохраняем задачу в БД
         db = SessionLocal()
         try:
             if image_url:
@@ -439,7 +682,7 @@ async def generate_image(payload: GenerateRequest):
             task = Task(
                 task_id=task_id,
                 prompt=payload.prompt,
-                user_id=payload.user_id,
+                user_id=str(current_user.id),
                 type="image",
                 status=status,
                 result_url=result_url,
@@ -449,22 +692,18 @@ async def generate_image(payload: GenerateRequest):
         finally:
             db.close()
         
-        # Возвращаем ответ
         if image_url:
-            # Если получили изображение, возвращаем его URL
             return GenerateResponse(
                 task_id=task_id,
                 status="completed",
                 image_url=image_url
             )
         else:
-            # Если изображение еще не готово, возвращаем placeholder
-            # В реальном сценарии можно добавить отдельный endpoint для опроса статуса
             placeholder_url = f"https://placehold.co/512x512/3b82f6/ffffff/png?text=Processing+{task_id[:8]}"
             return GenerateResponse(
                 task_id=task_id,
                 status="processing",
-                image_url=placeholder_url  # Placeholder пока изображение генерируется
+                image_url=placeholder_url
             )
         
     except requests.exceptions.Timeout:
@@ -509,32 +748,138 @@ async def generate_image(payload: GenerateRequest):
 
 
 @app.post("/api/generate/video", response_model=GenerateVideoResponse)
-async def generate_video(payload: GenerateRequest):
-    await asyncio.sleep(10)
-    task_id = f"mock_video_{int(time.time())}"
-    video_url = "https://placehold.co/600x400/cc0000/ffffff/png?text=Video+MOCK"
-
-    db = SessionLocal()
-    try:
-        task = Task(
-            task_id=task_id,
-            prompt=payload.prompt,
-            user_id=payload.user_id,
-            type="video",
-            status="completed",
-            result_url=video_url,
+async def generate_video(payload: GenerateRequest, current_user: User = Depends(get_current_user)):
+    check_prompt_guardrails(payload.prompt)
+    if not COMFY_URL:
+        raise HTTPException(
+            status_code=500,
+            detail="COMFY_URL not configured. Please set RUNPOD_COMFY_URL environment variable."
         )
-        db.add(task)
-        db.commit()
-    finally:
-        db.close()
 
-    return GenerateVideoResponse(
-        task_id=task_id,
-        status="completed",
-        message="Video generation mock completed.",
-        video_url=video_url,
-    )
+    workflow = copy.deepcopy(COMFY_VIDEO_WORKFLOW_TEMPLATE)
+    workflow["3"]["inputs"]["steps"] = payload.steps
+    workflow["3"]["inputs"]["seed"] = random.randint(0, 2**32 - 1)
+    workflow["6"]["inputs"]["text"] = payload.prompt
+
+    client_id = f"shai_academy_vid_{int(time.time())}"
+    prompt_data = {
+        "prompt": workflow,
+        "client_id": client_id
+    }
+
+    logger.info(f"Sending video request to ComfyUI: {COMFY_URL}")
+    logger.info(f"Client ID: {client_id}")
+    logger.debug(f"Video workflow data: {json.dumps(workflow, indent=2)}")
+
+    try:
+        comfy_url = f"{COMFY_URL.rstrip('/')}/prompt"
+        logger.info(f"Trying URL: {comfy_url}")
+        response = requests.post(
+            comfy_url,
+            json=prompt_data,
+            headers={"Content-Type": "application/json"},
+            timeout=180
+        )
+        logger.info(f"Response status: {response.status_code}")
+        logger.info(f"Response headers: {dict(response.headers)}")
+        response_text = response.text
+        logger.debug(f"Response text: {response_text}")
+        if response.status_code != 200:
+            error_detail = f"ComfyUI returned status {response.status_code}"
+            try:
+                error_json = response.json()
+                logger.error(f"ComfyUI error JSON: {json.dumps(error_json, indent=2)}")
+                if isinstance(error_json, dict):
+                    if "error" in error_json:
+                        error_detail += f": {error_json['error']}"
+                    elif "message" in error_json:
+                        error_detail += f": {error_json['message']}"
+                    else:
+                        error_detail += f": {error_json}"
+            except Exception:
+                error_detail += f": {response_text[:500]}"
+            raise HTTPException(status_code=502, detail=error_detail)
+
+        comfy_response = response.json()
+        logger.info(f"ComfyUI response: {json.dumps(comfy_response, indent=2)}")
+        task_id = comfy_response.get("prompt_id", f"comfy_video_{int(time.time())}")
+
+        # Ждем готовности видео (webm/mp4/webp/png)
+        video_url = get_comfyui_output_url(
+            task_id,
+            max_wait=180,
+            allowed_ext=["webm", "mp4", "webp", "png"]
+        )
+
+        db = SessionLocal()
+        try:
+            status = "completed" if video_url else "processing"
+            result_url = video_url or ""
+            task = Task(
+                task_id=task_id,
+                prompt=payload.prompt,
+                user_id=str(current_user.id),
+                type="video",
+                status=status,
+                result_url=result_url,
+            )
+            db.add(task)
+            db.commit()
+        finally:
+            db.close()
+
+        if video_url:
+            return GenerateVideoResponse(
+                task_id=task_id,
+                status="completed",
+                message="Video generated successfully",
+                video_url=video_url,
+            )
+        else:
+            placeholder_url = f"https://placehold.co/512x512/ff7849/ffffff/png?text=Video+Processing+{task_id[:8]}"
+            return GenerateVideoResponse(
+                task_id=task_id,
+                status="processing",
+                message="Video is still processing",
+                video_url=placeholder_url,
+            )
+
+    except requests.exceptions.Timeout:
+        logger.error("Timeout connecting to ComfyUI (video)")
+        raise HTTPException(
+            status_code=502,
+            detail="ComfyUI video request timed out. Please check if the service is running."
+        )
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Connection error (video): {str(e)}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Cannot connect to ComfyUI at {COMFY_URL}. Please check the URL and ensure the service is running."
+        )
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error (video): {e.response.status_code} - {e.response.text}")
+        error_detail = f"ComfyUI returned status {e.response.status_code}"
+        try:
+            error_json = e.response.json()
+            if "error" in error_json:
+                error_detail += f": {error_json['error']}"
+            elif "message" in error_json:
+                error_detail += f": {error_json['message']}"
+        except Exception:
+            error_detail += f": {e.response.text[:500]}"
+        raise HTTPException(status_code=502, detail=error_detail)
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error (video): {str(e)}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to connect to ComfyUI: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error (video): {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        )
 
 
 @app.get("/api/tasks", response_model=list[TaskResponse])
@@ -547,9 +892,32 @@ async def get_tasks():
         db.close()
 
 
+@app.post("/api/auth/register", response_model=AuthResponse, status_code=201)
+def register(user: UserCreate, db: SessionLocal = Depends(get_db)):
+    if len(user.password) > 72:
+        raise HTTPException(status_code=400, detail="Password too long (max 72 characters)")
+    existing = get_user_by_email(db, user.email)
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    hashed_pw = get_password_hash(user.password)
+    new_user = User(email=user.email, name=user.name, hashed_password=hashed_pw)
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
+    token = create_access_token({"sub": str(new_user.id)})
+    return AuthResponse(access_token=token)
+
+
 @app.post("/api/auth/login", response_model=AuthResponse)
-async def login(auth: AuthRequest):
-    return AuthResponse(access_token="mock_jwt_token")
+def login(auth: UserLogin, db: SessionLocal = Depends(get_db)):
+    user = get_user_by_email(db, auth.email)
+    if not user or not verify_password(auth.password, user.hashed_password):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+
+    token = create_access_token({"sub": str(user.id)})
+    return AuthResponse(access_token=token)
 
 
 @app.get("/api/tasks/{task_id}/status", response_model=GenerateResponse)

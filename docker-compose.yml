@@ -45,7 +45,8 @@ services:
     depends_on:
       - fastapi_api
     ports:
-      - "80:3000"
+      - "80:80"      # прод/стандартный HTTP
+      - "3000:80"    # удобство для локальной проверки
     networks:
       default:
         aliases:

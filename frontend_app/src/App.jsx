@@ -27,7 +27,7 @@ import LoginIcon from "@mui/icons-material/Login";
 import CloudUploadIcon from "@mui/icons-material/CloudUpload";
 import DownloadIcon from "@mui/icons-material/Download";
 import RocketLaunchIcon from "@mui/icons-material/RocketLaunch";
-import { login, generate } from "./api";
+import { login, register, generate, generateVideo } from "./api";
 
 export default function App() {
   const [token, setToken] = useState("");
@@ -36,23 +36,43 @@ export default function App() {
   const [error, setError] = useState("");
   const [tasks, setTasks] = useState([]);
   const [tab, setTab] = useState(0);
-  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
+  const [name, setName] = useState("");
   const [password, setPassword] = useState("");
+  const [authMode, setAuthMode] = useState("login"); // login | register
+  const [genType, setGenType] = useState("image"); // 'image' | 'video'
 
   useEffect(() => {
     const saved = localStorage.getItem("gen_token");
     if (saved) setToken(saved);
   }, []);
 
-  const handleLogin = async () => {
+  const handleAuth = async () => {
     setError("");
     try {
-      const res = await login(username, password);
+      let res;
+      if (authMode === "register") {
+        if (!email || !name || !password) {
+          setError("Email, Name and Password are required.");
+          return;
+        }
+        res = await register({ email, name, password });
+      } else {
+        if (!email || !password) {
+          setError("Email and Password are required.");
+          return;
+        }
+        res = await login(email, password);
+      }
       setToken(res.access_token);
       localStorage.setItem("gen_token", res.access_token);
       setTab(1);
     } catch (err) {
-      setError("Auth failed. Please check credentials or API availability.");
+      setError(
+        err.response?.data?.detail ||
+        err.message ||
+        "Auth failed. Please check credentials or API availability."
+      );
     }
   };
 
@@ -64,17 +84,31 @@ export default function App() {
     setLoading(true);
     setError("");
     try {
-      const res = await generate({ prompt, token });
+      const isVideo = genType === "video";
+      if (!token) {
+        setError("Please sign in first.");
+        setLoading(false);
+        return;
+      }
+
+      const res = isVideo
+        ? await generateVideo({ prompt, token })
+        : await generate({ prompt, token });
+
       console.log("Generation response:", res);
-      if (res && res.image_url) {
+      const url = isVideo ? res.video_url : res.image_url;
+
+      if (res && url) {
         const newTask = {
           ...res,
           prompt,
+          type: isVideo ? "video" : "image",
+          url,
         };
         setTasks((prev) => [newTask, ...prev]);
         setPrompt("");
       } else {
-        setError("Invalid response from server. Missing image_url.");
+        setError("Invalid response from server. Missing result URL.");
       }
     } catch (err) {
       console.error("Generation error:", err);
@@ -200,14 +234,39 @@ export default function App() {
               >
                 <Stack spacing={2}>
                   <Typography variant="subtitle1" fontWeight={700}>
-                    Sign in
+                    {authMode === "login" ? "Sign in" : "Register"}
                   </Typography>
+                  <Stack direction="row" spacing={1}>
+                    <Chip
+                      label="Login"
+                      color={authMode === "login" ? "primary" : "default"}
+                      variant={authMode === "login" ? "filled" : "outlined"}
+                      onClick={() => setAuthMode("login")}
+                      clickable
+                    />
+                    <Chip
+                      label="Register"
+                      color={authMode === "register" ? "primary" : "default"}
+                      variant={authMode === "register" ? "filled" : "outlined"}
+                      onClick={() => setAuthMode("register")}
+                      clickable
+                    />
+                  </Stack>
                   <TextField
-                    label="Username"
+                    label="Email"
+                    type="email"
                     fullWidth
-                    value={username}
-                    onChange={(e) => setUsername(e.target.value)}
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
                   />
+                  {authMode === "register" && (
+                    <TextField
+                      label="Name"
+                      fullWidth
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
+                    />
+                  )}
                   <TextField
                     label="Password"
                     type="password"
@@ -218,10 +277,10 @@ export default function App() {
                   <Button
                     variant="contained"
                     startIcon={<LoginIcon />}
-                    onClick={handleLogin}
+                    onClick={handleAuth}
                     size="large"
                   >
-                    Sign In
+                    {authMode === "login" ? "Sign In" : "Register"}
                   </Button>
                 </Stack>
               </Paper>
@@ -251,7 +310,22 @@ export default function App() {
                         Be descriptive for the best results.
                       </Typography>
                     </Box>
-                    <Chip label="Image" color="primary" variant="outlined" />
+                    <Stack direction="row" spacing={1}>
+                      <Chip
+                        label="Image"
+                        color={genType === "image" ? "primary" : "default"}
+                        variant={genType === "image" ? "filled" : "outlined"}
+                        onClick={() => setGenType("image")}
+                        clickable
+                      />
+                      <Chip
+                        label="Video"
+                        color={genType === "video" ? "primary" : "default"}
+                        variant={genType === "video" ? "filled" : "outlined"}
+                        onClick={() => setGenType("video")}
+                        clickable
+                      />
+                    </Stack>
                   </Box>
                   {error && (
                     <Alert severity="error">{error}</Alert>
@@ -302,20 +376,45 @@ export default function App() {
                     </Typography>
                   </Box>
                 </Box>
-                {latest ? (
-                  <Box
-                    component="img"
-                    src={latest.image_url}
-                    alt="latest"
-                    sx={{
-                      width: "100%",
-                      borderRadius: 2,
-                      height: 360,
-                      objectFit: "cover",
-                      border: "1px solid #e2e8f0",
-                    }}
-                  />
-                ) : (
+                {latest ? (() => {
+                  const url = latest.url || latest.video_url || latest.image_url;
+                  const isVideoFile = /\.(webm|mp4)$/i.test(url || "");
+                  if (latest.type === "video" && isVideoFile) {
+                    return (
+                      <Box
+                        component="video"
+                        src={url}
+                        controls
+                        sx={{
+                          width: "100%",
+                          maxWidth: "100%",
+                          borderRadius: 2,
+                          height: 360,
+                          objectFit: "contain",
+                          border: "1px solid #e2e8f0",
+                          backgroundColor: "#000",
+                          display: "block",
+                        }}
+                      />
+                    );
+                  }
+                  return (
+                    <Box
+                      component="img"
+                      src={url}
+                      alt="latest"
+                      sx={{
+                        width: "100%",
+                        maxWidth: "100%",
+                        borderRadius: 2,
+                        height: 360,
+                        objectFit: "contain",
+                        border: "1px solid #e2e8f0",
+                        display: "block",
+                      }}
+                    />
+                  );
+                })() : (
                   <Skeleton
                     variant="rectangular"
                     height={360}
@@ -380,24 +479,56 @@ export default function App() {
                 >
                   <CardContent>
                     <Stack direction="row" alignItems="center" spacing={1}>
-                      <Chip label="Image" color="primary" size="small" />
+                      <Chip
+                        label={task.type === "video" ? "Video" : "Image"}
+                        color="primary"
+                        size="small"
+                      />
                       <Typography variant="body2" color="text.secondary" noWrap>
                         {task.prompt}
                       </Typography>
                     </Stack>
-                    <Box
-                      component="img"
-                      src={task.image_url}
-                      alt="result"
-                      sx={{
-                        width: "100%",
-                        borderRadius: 2,
-                        mt: 1.5,
-                        height: 180,
-                        objectFit: "cover",
-                        border: "1px solid #e2e8f0",
-                      }}
-                    />
+                    {(() => {
+                      const url = task.url || task.video_url || task.image_url;
+                      const isVideoFile = /\.(webm|mp4)$/i.test(url || "");
+                      if (task.type === "video" && isVideoFile) {
+                        return (
+                          <Box
+                            component="video"
+                            src={url}
+                            controls
+                            sx={{
+                              width: "100%",
+                              maxWidth: "100%",
+                              borderRadius: 2,
+                              mt: 1.5,
+                              height: 180,
+                              objectFit: "contain",
+                              border: "1px solid #e2e8f0",
+                              backgroundColor: "#000",
+                              display: "block",
+                            }}
+                          />
+                        );
+                      }
+                      return (
+                        <Box
+                          component="img"
+                          src={url}
+                          alt="result"
+                          sx={{
+                            width: "100%",
+                            maxWidth: "100%",
+                            borderRadius: 2,
+                            mt: 1.5,
+                            height: 180,
+                            objectFit: "contain",
+                            border: "1px solid #e2e8f0",
+                            display: "block",
+                          }}
+                        />
+                      );
+                    })()}
                     <Divider sx={{ my: 1.2 }} />
                     <Typography variant="body2" color="success.main">
                       Status: {task.status || "completed"}
@@ -411,8 +542,8 @@ export default function App() {
                       size="small"
                       startIcon={<DownloadIcon />}
                       component="a"
-                      href={task.image_url}
-                      download={`image-${task.task_id}.png`}
+                      href={task.url || task.image_url || task.video_url}
+                      download={`${task.type || "file"}-${task.task_id}`}
                       target="_blank"
                       rel="noreferrer"
                     >

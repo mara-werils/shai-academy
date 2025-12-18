@@ -10,9 +10,11 @@
 
 ## Быстрый старт
 
-1. Создайте файл `.env` в корне проекта и добавьте URL вашего ComfyUI на RunPod:
+1. Создайте файл `.env` в корне проекта и добавьте URL вашего ComfyUI на RunPod и JWT секрет:
 ```bash
 RUNPOD_COMFY_URL=https://your-pod-id.runpod.net
+JWT_SECRET=change-me
+JWT_EXPIRE_MINUTES=60
 ```
 
 2. Запустите все сервисы:
@@ -21,7 +23,7 @@ docker-compose up --build
 ```
 
 2. Откройте в браузере:
-- **Фронтенд**: http://localhost:3000
+- **Фронтенд**: http://localhost или http://localhost:3000 (оба варианта работают)
 - **API Swagger**: http://localhost:8000/docs
 
 ## Использование
@@ -50,18 +52,23 @@ docker-compose up --build
 1. **Для Docker Compose**: Создайте файл `.env` в корне проекта:
    ```
    RUNPOD_COMFY_URL=https://your-pod-id.runpod.net
+   JWT_SECRET=change-me
+   JWT_EXPIRE_MINUTES=60
    ```
 
 2. **Для локальной разработки**: Создайте файл `.env` в папке `fastapi_api/`:
    ```
    RUNPOD_COMFY_URL=https://your-pod-id.runpod.net
+   JWT_SECRET=change-me
+   JWT_EXPIRE_MINUTES=60
    ```
 
 ## API Endpoints
 
-- `POST /api/auth/login` — авторизация (мок)
-- `POST /api/generate/image` — генерация изображения (требует `prompt` и `steps`)
-- `POST /api/generate/video` — генерация видео (мок)
+- `POST /api/auth/register` — регистрация (email, name, password)
+- `POST /api/auth/login` — авторизация (email, password) -> JWT access_token
+- `POST /api/generate/image` — генерация изображения (требует `prompt` и `steps`, JWT)
+- `POST /api/generate/video` — генерация видео (требует `prompt` и `steps`, JWT)
 - `GET /api/tasks` — список последних задач
 
 
